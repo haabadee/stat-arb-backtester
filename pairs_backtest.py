@@ -379,7 +379,7 @@ def main():
         beta_col=beta_col,
         static_beta=static_beta
     )
-    grid_results.to_csv("outputs/pairs_v2_grid_search_results.csv", index=False)
+    grid_results.to_csv("outputs/pairs_grid_search_results.csv", index=False)
 
     best = grid_results.iloc[0]
     best_window = int(best["window"])
@@ -421,11 +421,11 @@ def main():
     print_metrics("Test Strategy Metrics", test_metrics)
     print_metrics("Test Benchmark Metrics", benchmark_metrics)
 
-    train_bt.to_csv("outputs/pairs_v2_train_backtest.csv")
-    test_bt.to_csv("outputs/pairs_v2_test_backtest.csv")
+    train_bt.to_csv("outputs/pairs_train_backtest.csv")
+    test_bt.to_csv("outputs/pairs_test_backtest.csv")
 
-    save_plot(train_bt, ticker1, ticker2, spread_col, "outputs/pairs_v2_train_plot.png")
-    save_plot(test_bt, ticker1, ticker2, spread_col, "outputs/pairs_v2_test_plot.png")
+    save_plot(train_bt, ticker1, ticker2, spread_col, "outputs/pairs_train_plot.png")
+    save_plot(test_bt, ticker1, ticker2, spread_col, "outputs/pairs_test_plot.png")
 
     print("\nDone. Outputs saved to outputs/")
 
