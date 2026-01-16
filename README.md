@@ -39,6 +39,15 @@ $$
 
 The pairs framework aims to isolate relative mispricing instead of outright market direction.
 
+### 3. Multi-Pair Screening
+The repository also includes a pair screening workflow that:
+- downloads a universe of related tickers
+- generates all possible ticker pairs
+- applies a cointegration test on the training set
+- estimates hedge ratios using OLS
+- backtests spread-based mean reversion on each valid pair
+- ranks pairs by out-of-sample performance
+
 ---
 
 ## Key Features

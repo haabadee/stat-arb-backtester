@@ -20,6 +20,7 @@ def download_universe_data(tickers, start, end):
 
     close = df["Close"].copy()
     close = close[tickers].dropna()
+
     print(f"Downloaded {len(close)} rows.")
     return close
 
@@ -56,6 +57,32 @@ def compute_spread(df: pd.DataFrame, ticker1: str, ticker2: str, intercept: floa
     return out
 
 
+def compute_rolling_spread(df: pd.DataFrame, ticker1: str, ticker2: str, rolling_window: int = 60):
+    out = df.copy()
+    intercepts = []
+    betas = []
+
+    for i in range(len(out)):
+        if i < rolling_window:
+            intercepts.append(np.nan)
+            betas.append(np.nan)
+            continue
+
+        sub = out.iloc[i - rolling_window:i]
+        y = sub[ticker1]
+        x = sm.add_constant(sub[ticker2])
+        model = sm.OLS(y, x).fit()
+
+        intercepts.append(model.params["const"])
+        betas.append(model.params[ticker2])
+
+    out["rolling_intercept"] = intercepts
+    out["rolling_beta"] = betas
+    out["spread"] = out[ticker1] - (out["rolling_intercept"] + out["rolling_beta"] * out[ticker2])
+
+    return out
+
+
 def generate_pairs_signals(df, window=20, entry_z=1.5, exit_z=0.5):
     df = df.copy()
 
@@ -75,9 +102,9 @@ def generate_pairs_signals(df, window=20, entry_z=1.5, exit_z=0.5):
 
         if prev_pos == 0:
             if z < -entry_z:
-                pair_position[i] = 1
+                pair_position[i] = 1   # long spread
             elif z > entry_z:
-                pair_position[i] = -1
+                pair_position[i] = -1  # short spread
             else:
                 pair_position[i] = 0
         elif prev_pos == 1:
@@ -95,20 +122,29 @@ def generate_pairs_signals(df, window=20, entry_z=1.5, exit_z=0.5):
     return df
 
 
-def run_pairs_backtest(df, ticker1, ticker2, beta, cost_per_turnover=0.0005):
+def run_pairs_backtest(df, ticker1, ticker2, beta=None, beta_col=None, cost_per_turnover=0.0005):
     df = df.copy()
 
     df[f"{ticker1}_ret"] = df[ticker1].pct_change().fillna(0)
     df[f"{ticker2}_ret"] = df[ticker2].pct_change().fillna(0)
 
+    if beta_col is not None:
+        df["beta_used"] = df[beta_col].ffill()
+    elif beta is not None:
+        df["beta_used"] = beta
+    else:
+        raise ValueError("Must provide either beta or beta_col.")
+
+    df = df.dropna(subset=["spread", "beta_used"]).copy()
+
     df["pair_position_lagged"] = df["pair_position"].shift(1).fillna(0)
 
-    beta_abs = abs(beta)
+    beta_abs = df["beta_used"].abs()
     w1 = 1.0 / (1.0 + beta_abs)
     w2 = beta_abs / (1.0 + beta_abs)
 
     df["w1"] = df["pair_position_lagged"] * w1
-    df["w2"] = -df["pair_position_lagged"] * np.sign(beta) * w2
+    df["w2"] = -df["pair_position_lagged"] * np.sign(df["beta_used"]) * w2
 
     df["strategy_gross_return"] = (
         df["w1"] * df[f"{ticker1}_ret"] +
@@ -158,38 +194,133 @@ def compute_metrics(returns: pd.Series):
     }
 
 
-def evaluate_pair(train_df, test_df, ticker1, ticker2, window=20, entry_z=1.5, exit_z=0.5, cost=0.0005):
-    score, pvalue = cointegration_test(train_df, ticker1, ticker2)
+def evaluate_strategy_for_pair(
+    train_pair_df,
+    test_pair_df,
+    ticker1,
+    ticker2,
+    window,
+    entry_z,
+    exit_z,
+    cost,
+    use_rolling_beta=True,
+    rolling_beta_window=60
+):
+    if use_rolling_beta:
+        train_spread_df = compute_rolling_spread(train_pair_df, ticker1, ticker2, rolling_window=rolling_beta_window)
+        test_spread_df = compute_rolling_spread(test_pair_df, ticker1, ticker2, rolling_window=rolling_beta_window)
 
-    intercept, beta = estimate_hedge_ratio_ols(train_df, ticker1, ticker2)
+        train_signal = generate_pairs_signals(train_spread_df, window=window, entry_z=entry_z, exit_z=exit_z)
+        test_signal = generate_pairs_signals(test_spread_df, window=window, entry_z=entry_z, exit_z=exit_z)
 
-    train_spread = compute_spread(train_df[[ticker1, ticker2]], ticker1, ticker2, intercept, beta)
-    test_spread = compute_spread(test_df[[ticker1, ticker2]], ticker1, ticker2, intercept, beta)
+        train_bt = run_pairs_backtest(
+            train_signal, ticker1, ticker2, beta_col="rolling_beta", cost_per_turnover=cost
+        )
+        test_bt = run_pairs_backtest(
+            test_signal, ticker1, ticker2, beta_col="rolling_beta", cost_per_turnover=cost
+        )
 
-    train_signal = generate_pairs_signals(train_spread, window=window, entry_z=entry_z, exit_z=exit_z)
-    test_signal = generate_pairs_signals(test_spread, window=window, entry_z=entry_z, exit_z=exit_z)
+        intercept = np.nan
+        beta = np.nan
 
-    train_bt = run_pairs_backtest(train_signal, ticker1, ticker2, beta, cost_per_turnover=cost)
-    test_bt = run_pairs_backtest(test_signal, ticker1, ticker2, beta, cost_per_turnover=cost)
+    else:
+        intercept, beta = estimate_hedge_ratio_ols(train_pair_df, ticker1, ticker2)
 
-    train_metrics = compute_metrics(train_bt["strategy_net_return"])
-    test_metrics = compute_metrics(test_bt["strategy_net_return"])
+        train_spread_df = compute_spread(train_pair_df, ticker1, ticker2, intercept, beta)
+        test_spread_df = compute_spread(test_pair_df, ticker1, ticker2, intercept, beta)
+
+        train_signal = generate_pairs_signals(train_spread_df, window=window, entry_z=entry_z, exit_z=exit_z)
+        test_signal = generate_pairs_signals(test_spread_df, window=window, entry_z=entry_z, exit_z=exit_z)
+
+        train_bt = run_pairs_backtest(
+            train_signal, ticker1, ticker2, beta=beta, cost_per_turnover=cost
+        )
+        test_bt = run_pairs_backtest(
+            test_signal, ticker1, ticker2, beta=beta, cost_per_turnover=cost
+        )
+
+    train_metrics = compute_metrics(train_bt["strategy_net_return"]) if not train_bt.empty else {}
+    test_metrics = compute_metrics(test_bt["strategy_net_return"]) if not test_bt.empty else {}
 
     return {
-        "pair": f"{ticker1}-{ticker2}",
-        "ticker1": ticker1,
-        "ticker2": ticker2,
-        "cointegration_score": score,
-        "cointegration_pvalue": pvalue,
         "intercept": intercept,
         "beta": beta,
-        "train_annual_return": train_metrics.get("annual_return", np.nan),
-        "train_sharpe": train_metrics.get("sharpe_ratio", np.nan),
-        "train_max_drawdown": train_metrics.get("max_drawdown", np.nan),
-        "test_annual_return": test_metrics.get("annual_return", np.nan),
-        "test_sharpe": test_metrics.get("sharpe_ratio", np.nan),
-        "test_max_drawdown": test_metrics.get("max_drawdown", np.nan),
-    }, train_bt, test_bt
+        "train_bt": train_bt,
+        "test_bt": test_bt,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics
+    }
+
+
+def grid_search_pair(
+    train_pair_df,
+    test_pair_df,
+    ticker1,
+    ticker2,
+    cost=0.0005,
+    use_rolling_beta=False,
+    rolling_beta_window=60
+):
+    windows = [10, 20, 30, 40]
+    entry_thresholds = [1.0, 1.5, 2.0]
+    exit_thresholds = [0.25, 0.5, 1.0]
+
+    results = []
+    saved_runs = {}
+
+    for window in windows:
+        for entry_z in entry_thresholds:
+            for exit_z in exit_thresholds:
+                if exit_z >= entry_z:
+                    continue
+
+                try:
+                    eval_result = evaluate_strategy_for_pair(
+                        train_pair_df=train_pair_df,
+                        test_pair_df=test_pair_df,
+                        ticker1=ticker1,
+                        ticker2=ticker2,
+                        window=window,
+                        entry_z=entry_z,
+                        exit_z=exit_z,
+                        cost=cost,
+                        use_rolling_beta=use_rolling_beta,
+                        rolling_beta_window=rolling_beta_window
+                    )
+
+                    train_metrics = eval_result["train_metrics"]
+                    test_metrics = eval_result["test_metrics"]
+
+                    row = {
+                        "window": window,
+                        "entry_z": entry_z,
+                        "exit_z": exit_z,
+                        "train_annual_return": train_metrics.get("annual_return", np.nan),
+                        "train_sharpe": train_metrics.get("sharpe_ratio", np.nan),
+                        "train_max_drawdown": train_metrics.get("max_drawdown", np.nan),
+                        "test_annual_return": test_metrics.get("annual_return", np.nan),
+                        "test_sharpe": test_metrics.get("sharpe_ratio", np.nan),
+                        "test_max_drawdown": test_metrics.get("max_drawdown", np.nan),
+                    }
+                    results.append(row)
+
+                    key = (window, entry_z, exit_z)
+                    saved_runs[key] = eval_result
+
+                except Exception as e:
+                    continue
+
+    results_df = pd.DataFrame(results)
+    if results_df.empty:
+        return results_df, None, None
+
+    results_df = results_df.sort_values(by="train_sharpe", ascending=False).reset_index(drop=True)
+
+    best = results_df.iloc[0]
+    best_key = (int(best["window"]), float(best["entry_z"]), float(best["exit_z"]))
+    best_eval = saved_runs[best_key]
+
+    return results_df, best, best_eval
 
 
 def plot_pair_backtest(df, ticker1, ticker2, filename):
@@ -205,7 +336,7 @@ def plot_pair_backtest(df, ticker1, ticker2, filename):
 
     axes[2].plot(df.index, df["zscore"], color="orange")
     axes[2].axhline(0, color="black")
-    axes[2].set_title("Spread Z-Score")
+    axes[2].set_title("Spread Z-score")
 
     axes[3].plot(df.index, df["cum_strategy"], label="Strategy", color="green")
     axes[3].plot(df.index, df["cum_benchmark"], label="Benchmark", color="gray")
@@ -215,7 +346,6 @@ def plot_pair_backtest(df, ticker1, ticker2, filename):
     plt.tight_layout()
     plt.savefig(filename, dpi=200)
     plt.close()
-    print(f"Saved plot to {filename}")
 
 
 def main():
@@ -226,70 +356,121 @@ def main():
     end = "2025-01-01"
     split_date = "2024-01-01"
 
-    entry_z = 1.5
-    exit_z = 0.5
-    window = 20
     cost = 0.0005
-    max_pvalue = 0.10   # screening threshold
+    max_pvalue = 0.10
+    use_rolling_beta = True
+    rolling_beta_window = 60
 
     prices = download_universe_data(tickers, start, end)
     train_prices, test_prices = split_train_test(prices, split_date)
 
-    pair_results = []
-    saved_backtests = {}
-
     all_pairs = list(itertools.combinations(tickers, 2))
-    print(f"Testing {len(all_pairs)} pairs...")
+    print(f"Testing {len(all_pairs)} candidate pairs...\n")
+
+    summary_rows = []
+    saved_pair_details = {}
 
     for ticker1, ticker2 in all_pairs:
         try:
-            result, train_bt, test_bt = evaluate_pair(
-                train_prices,
-                test_prices,
-                ticker1,
-                ticker2,
-                window=window,
-                entry_z=entry_z,
-                exit_z=exit_z,
-                cost=cost
+            train_pair_df = train_prices[[ticker1, ticker2]].dropna().copy()
+            test_pair_df = test_prices[[ticker1, ticker2]].dropna().copy()
+
+            if len(train_pair_df) < 100 or len(test_pair_df) < 50:
+                continue
+
+            score, pvalue = cointegration_test(train_pair_df, ticker1, ticker2)
+
+            print(f"Evaluating {ticker1}-{ticker2} | coint p-value={pvalue:.4f}")
+
+            if pvalue > max_pvalue:
+                print("  Skipping due to weak cointegration.\n")
+                continue
+
+            grid_results, best_params, best_eval = grid_search_pair(
+                train_pair_df=train_pair_df,
+                test_pair_df=test_pair_df,
+                ticker1=ticker1,
+                ticker2=ticker2,
+                cost=cost,
+                use_rolling_beta=use_rolling_beta,
+                rolling_beta_window=rolling_beta_window
             )
 
-            if result["cointegration_pvalue"] <= max_pvalue:
-                pair_results.append(result)
-                saved_backtests[result["pair"]] = (train_bt, test_bt)
-                print(
-                    f"{result['pair']}: p={result['cointegration_pvalue']:.4f}, "
-                    f"train_sharpe={result['train_sharpe']:.4f}, "
-                    f"test_sharpe={result['test_sharpe']:.4f}"
-                )
+            if grid_results.empty or best_params is None or best_eval is None:
+                print("  No valid parameter combinations.\n")
+                continue
+
+            train_metrics = best_eval["train_metrics"]
+            test_metrics = best_eval["test_metrics"]
+
+            summary_row = {
+                "pair": f"{ticker1}-{ticker2}",
+                "ticker1": ticker1,
+                "ticker2": ticker2,
+                "cointegration_score": score,
+                "cointegration_pvalue": pvalue,
+                "best_window": int(best_params["window"]),
+                "best_entry_z": float(best_params["entry_z"]),
+                "best_exit_z": float(best_params["exit_z"]),
+                "train_annual_return": train_metrics.get("annual_return", np.nan),
+                "train_sharpe": train_metrics.get("sharpe_ratio", np.nan),
+                "train_max_drawdown": train_metrics.get("max_drawdown", np.nan),
+                "test_annual_return": test_metrics.get("annual_return", np.nan),
+                "test_sharpe": test_metrics.get("sharpe_ratio", np.nan),
+                "test_max_drawdown": test_metrics.get("max_drawdown", np.nan),
+            }
+
+            summary_rows.append(summary_row)
+            saved_pair_details[f"{ticker1}-{ticker2}"] = {
+                "grid_results": grid_results,
+                "best_eval": best_eval,
+                "ticker1": ticker1,
+                "ticker2": ticker2
+            }
+
+            print(
+                f"  Best train Sharpe={summary_row['train_sharpe']:.4f}, "
+                f"test Sharpe={summary_row['test_sharpe']:.4f}\n"
+            )
 
         except Exception as e:
-            print(f"Skipping {ticker1}-{ticker2}: {e}")
+            print(f"  Error on {ticker1}-{ticker2}: {e}\n")
+            continue
 
-    if not pair_results:
-        print("No pairs passed the screening threshold.")
+    if not summary_rows:
+        print("No pairs passed screening.")
         return
 
-    results_df = pd.DataFrame(pair_results)
-    results_df = results_df.sort_values(by="test_sharpe", ascending=False)
-    results_df.to_csv("outputs/pair_screen_results.csv", index=False)
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df = summary_df.sort_values(by="test_sharpe", ascending=False).reset_index(drop=True)
+    summary_df.to_csv("outputs/pair_screen_results.csv", index=False)
 
-    print("\nTop pairs by test Sharpe:")
-    print(results_df.head(10))
+    print("\nTop pairs by out-of-sample Sharpe:")
+    print(summary_df.head(10))
 
-    top_pair = results_df.iloc[0]["pair"]
-    top_ticker1 = results_df.iloc[0]["ticker1"]
-    top_ticker2 = results_df.iloc[0]["ticker2"]
+    top_pair = summary_df.iloc[0]["pair"]
+    top_info = saved_pair_details[top_pair]
 
-    top_train_bt, top_test_bt = saved_backtests[top_pair]
-    top_train_bt.to_csv(f"outputs/{top_pair}_train_backtest.csv")
-    top_test_bt.to_csv(f"outputs/{top_pair}_test_backtest.csv")
+    top_grid = top_info["grid_results"]
+    top_eval = top_info["best_eval"]
+    ticker1 = top_info["ticker1"]
+    ticker2 = top_info["ticker2"]
 
-    plot_pair_backtest(top_train_bt, top_ticker1, top_ticker2, f"outputs/{top_pair}_train_plot.png")
-    plot_pair_backtest(top_test_bt, top_ticker1, top_ticker2, f"outputs/{top_pair}_test_plot.png")
+    top_grid.to_csv(f"outputs/{top_pair}_grid_results.csv", index=False)
+    top_eval["train_bt"].to_csv(f"outputs/{top_pair}_train_backtest.csv")
+    top_eval["test_bt"].to_csv(f"outputs/{top_pair}_test_backtest.csv")
+
+    plot_pair_backtest(top_eval["train_bt"], ticker1, ticker2, f"outputs/{top_pair}_train_plot.png")
+    plot_pair_backtest(top_eval["test_bt"], ticker1, ticker2, f"outputs/{top_pair}_test_plot.png")
 
     print(f"\nBest pair: {top_pair}")
-    print("Detailed outputs saved to outputs/")
+    print("Saved:")
+    print("- pair_screen_results.csv")
+    print(f"- {top_pair}_grid_results.csv")
+    print(f"- {top_pair}_train_backtest.csv")
+    print(f"- {top_pair}_test_backtest.csv")
+    print(f"- {top_pair}_train_plot.png")
+    print(f"- {top_pair}_test_plot.png")
 
 
 if __name__ == "__main__":
