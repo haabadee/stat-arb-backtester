@@ -154,13 +154,6 @@ Create a virtual environment if desired, then install dependencies:
 pip install -r requirements.txt
 ~~~
 
-Typical dependencies include:
-- numpy
-- pandas
-- matplotlib
-- yfinance
-- statsmodels
-
 ---
 
 ## Running the Backtests
